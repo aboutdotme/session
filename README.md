@@ -1,5 +1,8 @@
 # express-session
 
+This is a **fork** of the express session middleware, modified to work with
+about.me's python sessions.
+
 [![NPM Version][npm-image]][npm-url]
 [![NPM Downloads][downloads-image]][downloads-url]
 [![Build Status][travis-image]][travis-url]
