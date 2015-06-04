@@ -74,7 +74,7 @@ var defer = typeof setImmediate === 'function'
  * @param {Boolean} [options.resave] Resave unmodified sessions back to the store
  * @param {Boolean} [options.rolling] Enable/disable rolling session expiration
  * @param {Boolean} [options.saveUninitialized] Save uninitialized sessions to the store
- * @param {String} [options.secret] Secret for signing session ID
+ * @param {String|Array} [options.secret] Secret for signing session ID
  * @param {Object} [options.store=MemoryStore] Session store
  * @param {Object} [options.signature] Object that has the same API as node-cookie-signature
    if you need to implement your own signing mechanism
@@ -94,6 +94,7 @@ function session(options){
     , rollingSessions = options.rolling || false;
   var resaveSession = options.resave;
   var saveUninitializedSession = options.saveUninitialized;
+  var secret = options.secret;
 
   var generateId = options.genid || generateSessionId;
 
@@ -128,6 +129,18 @@ function session(options){
   // TODO: switch to "destroy" on next major
   var unsetDestroy = options.unset === 'destroy';
 
+  if (Array.isArray(secret) && secret.length === 0) {
+    throw new TypeError('secret option array must contain one or more strings');
+  }
+
+  if (secret && !Array.isArray(secret)) {
+    secret = [secret];
+  }
+
+  if (!secret) {
+    deprecate('req.secret; provide secret option');
+  }
+
   // notify user that this store is not
   // meant for a production environment
   if ('production' == env && store instanceof MemoryStore) {
@@ -141,12 +154,9 @@ function session(options){
     req.session.cookie = new Cookie(cookie);
   };
 
+  var storeImplementsTouch = typeof store.touch === 'function';
   store.on('disconnect', function(){ storeReady = false; });
   store.on('connect', function(){ storeReady = true; });
-
-  if (!options.secret) {
-    deprecate('req.secret; provide secret option');
-  }
 
   return function session(req, res, next) {
     // self-awareness
@@ -160,12 +170,15 @@ function session(options){
     var originalPath = parseUrl.original(req).pathname;
     if (0 != originalPath.indexOf(cookie.path || '/')) return next();
 
+    // ensure a secret is available or bail
+    if (!secret && !req.secret) {
+      next(new Error('secret option required for sessions'));
+      return;
+    }
+
     // backwards compatibility for signed cookies
     // req.secret is passed from the cookie parser middleware
-    var secret = options.secret || req.secret;
-
-    // ensure secret is available or bail
-    if (!secret) next(new Error('`secret` option required for sessions'));
+    var secrets = secret || [req.secret];
 
     var originalHash;
     var originalId;
@@ -175,7 +188,7 @@ function session(options){
     req.sessionStore = store;
 
     // get the session ID from the cookie
-    var cookieId = req.sessionID = getcookie(req, name, secret, signer);
+    var cookieId = req.sessionID = getcookie(req, name, secrets, signer);
 
     // set-cookie
     onHeaders(res, function(){
@@ -196,7 +209,7 @@ function session(options){
         return;
       }
 
-      setcookie(res, name, req.sessionID, secret, cookie.data, signer);
+      setcookie(res, name, req.sessionID, secrets[0], cookie.data, signer);
     });
 
     // proxy end() to commit the session
@@ -290,6 +303,19 @@ function session(options){
         });
 
         return writetop();
+      } else if (storeImplementsTouch && shouldTouch(req)) {
+        // store implements touch method
+        debug('touching');
+        store.touch(req.sessionID, req.session, function ontouch(err) {
+          if (err) {
+            defer(next, err);
+          }
+
+          debug('touched');
+          writeend();
+        });
+
+        return writetop();
       }
 
       return _end.call(res, chunk, encoding);
@@ -338,13 +364,35 @@ function session(options){
 
     // determine if session should be saved to store
     function shouldSave(req) {
+      // cannot set cookie without a session ID
+      if (typeof req.sessionID !== 'string') {
+        debug('session ignored because of bogus req.sessionID %o', req.sessionID);
+        return false;
+      }
+
       return !saveUninitializedSession && cookieId !== req.sessionID
         ? isModified(req.session)
         : !isSaved(req.session)
     }
 
+    // determine if session should be touched
+    function shouldTouch(req) {
+      // cannot set cookie without a session ID
+      if (typeof req.sessionID !== 'string') {
+        debug('session ignored because of bogus req.sessionID %o', req.sessionID);
+        return false;
+      }
+
+      return cookieId === req.sessionID && !shouldSave(req);
+    }
+
     // determine if cookie should be set on response
     function shouldSetCookie(req) {
+      // cannot set cookie without a session ID
+      if (typeof req.sessionID !== 'string') {
+        return false;
+      }
+
       // in case of rolling session, always reset the cookie
       if (rollingSessions) {
         return true;
@@ -417,7 +465,7 @@ function generateSessionId(sess) {
  * @private
  */
 
-function getcookie(req, name, secret, signer) {
+function getcookie(req, name, secrets, signer) {
   var header = req.headers.cookie;
   var raw;
   var val;
@@ -429,7 +477,7 @@ function getcookie(req, name, secret, signer) {
     raw = cookies[name];
 
     if (raw) {
-      val = signer.unsign(raw, secret);
+      val = unsigncookie(raw, secrets);
 
       if (val === false) {
         debug('cookie signature missing or invalid');
@@ -452,7 +500,7 @@ function getcookie(req, name, secret, signer) {
     raw = req.cookies[name];
 
     if (raw) {
-      val = signer.unsign(raw, secret);
+      val = unsigncookie(raw, secrets);
 
       if (val) {
         deprecate('cookie should be available in req.headers.cookie');
@@ -540,4 +588,24 @@ function setcookie(res, name, val, secret, options, signer) {
     : [prev, data];
 
   res.setHeader('set-cookie', header)
+}
+
+/**
+ * Verify and decode the given `val` with `secrets`.
+ *
+ * @param {String} val
+ * @param {Array} secrets
+ * @returns {String|Boolean}
+ * @private
+ */
+function unsigncookie(val, secrets) {
+  for (var i = 0; i < secrets.length; i++) {
+    var result = signature.unsign(val, secrets[i]);
+
+    if (result !== false) {
+      return result;
+    }
+  }
+
+  return false;
 }
